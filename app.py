@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, send_file, g
 from flask_mysqldb import MySQL
 
+from google import genai
+from google.genai import types
+
 from werkzeug.security import generate_password_hash, check_password_hash
 from twilio.rest import Client
 import smtplib
@@ -35,7 +38,28 @@ from backup_system import create_backup, create_full_backup, restore_backup, lis
 
 from datetime import timedelta
 
+
+
+
 load_dotenv()
+
+
+# ==========================================================
+# GEMINI AI CONFIGURATION
+# ==========================================================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    logging.warning("GEMINI_API_KEY is not configured.")
+
+gemini_client = (
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
+    else None
+)
+
+GEMINI_MODEL = "gemini-3.8-flash"
 
 # ------------------------------
 # Basic config & logging
@@ -326,6 +350,237 @@ def audit_log(user_id, action, details=""):
         logging.info(f"user_id={user_id} action={action} details={details}")
     except Exception as e:
         print("Audit logging failed:", e)
+
+
+# ==========================================================
+# DAIRYMITR AI - DATABASE TOOLS
+# ==========================================================
+
+def get_today_milk():
+    """
+    Get today's milk collection for the currently logged-in
+    DairyMitr owner/staff account.
+
+    IMPORTANT:
+    session['id'] is the owner/user ID for both owner and staff.
+    Therefore this query is tenant-isolated using user_id.
+    """
+
+    try:
+
+        # --------------------------------------------------
+        # LOGIN / ROLE CHECK
+        # --------------------------------------------------
+
+        if not session.get("loggedin"):
+            return {
+                "success": False,
+                "error": "User is not logged in."
+            }
+
+        if session.get("role") not in ("owner", "staff"):
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        # --------------------------------------------------
+        # OWNER / DAIRY ID
+        # --------------------------------------------------
+
+        user_id = session.get("id")
+
+        if not user_id:
+            return {
+                "success": False,
+                "error": "User ID not found in session."
+            }
+
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "Invalid user ID."
+            }
+
+        # --------------------------------------------------
+        # TODAY IN INDIA
+        # --------------------------------------------------
+
+        today = datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        ).date()
+
+        # --------------------------------------------------
+        # DATABASE QUERY
+        # --------------------------------------------------
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                slot,
+                milk_type,
+                SUM(quantity) AS total_quantity
+            FROM milk_collection
+            WHERE
+                user_id=%s
+                AND DATE(date)=%s
+            GROUP BY
+                slot,
+                milk_type
+            ORDER BY
+                slot,
+                milk_type
+            """,
+            (
+                user_id,
+                today
+            )
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        # --------------------------------------------------
+        # DEFAULT VALUES
+        # --------------------------------------------------
+
+        morning_cow = 0.0
+        morning_buffalo = 0.0
+
+        evening_cow = 0.0
+        evening_buffalo = 0.0
+
+        # --------------------------------------------------
+        # PROCESS DATABASE RESULT
+        # --------------------------------------------------
+
+        for row in rows:
+
+            slot = str(
+                row.get("slot") or ""
+            ).lower().strip()
+
+            milk_type = str(
+                row.get("milk_type") or ""
+            ).lower().strip()
+
+            quantity = float(
+                row.get("total_quantity") or 0
+            )
+
+            # Morning
+            if slot == "morning":
+
+                if milk_type == "cow":
+
+                    morning_cow += quantity
+
+                elif milk_type == "buffalo":
+
+                    morning_buffalo += quantity
+
+                elif milk_type == "both":
+
+                    # If your database uses "both",
+                    # count it separately only if required.
+                    pass
+
+            # Evening
+            elif slot == "evening":
+
+                if milk_type == "cow":
+
+                    evening_cow += quantity
+
+                elif milk_type == "buffalo":
+
+                    evening_buffalo += quantity
+
+                elif milk_type == "both":
+
+                    pass
+
+        # --------------------------------------------------
+        # TOTALS
+        # --------------------------------------------------
+
+        morning_total = (
+            morning_cow +
+            morning_buffalo
+        )
+
+        evening_total = (
+            evening_cow +
+            evening_buffalo
+        )
+
+        total_milk = (
+            morning_total +
+            evening_total
+        )
+
+        # --------------------------------------------------
+        # RETURN DATA TO GEMINI
+        # --------------------------------------------------
+
+        return {
+            "success": True,
+
+            "date": str(today),
+
+            "morning": {
+                "cow_liters": round(
+                    morning_cow,
+                    2
+                ),
+                "buffalo_liters": round(
+                    morning_buffalo,
+                    2
+                ),
+                "total_liters": round(
+                    morning_total,
+                    2
+                )
+            },
+
+            "evening": {
+                "cow_liters": round(
+                    evening_cow,
+                    2
+                ),
+                "buffalo_liters": round(
+                    evening_buffalo,
+                    2
+                ),
+                "total_liters": round(
+                    evening_total,
+                    2
+                )
+            },
+
+            "total_liters": round(
+                total_milk,
+                2
+            )
+        }
+
+    except Exception as e:
+
+        logging.exception(
+            "get_today_milk failed"
+        )
+
+        return {
+            "success": False,
+            "error": "Unable to retrieve today's milk data."
+        }
 
 
 
@@ -8698,7 +8953,3384 @@ def healthcheck():
     return "OK"
 
 
-import os
+# ==========================================================
+# ==========================================================
+#                 DAIRYMITR AI SYSTEM
+# ==========================================================
+# ==========================================================
+
+
+# ==========================================================
+# 1. DAIRYMITR AI SYSTEM INSTRUCTION
+# ==========================================================
+
+DAIRYMITR_AI_INSTRUCTION = """
+
+You are DairyMitr AI, the intelligent AI assistant of DairyMitr.
+
+DairyMitr is a dairy management platform used by dairy owners
+and staff to manage milk collection, vendors, payments,
+advances, food sacks, milk rates and dairy reports.
+
+==============================================================
+LANGUAGE
+==============================================================
+
+You understand:
+
+- Marathi
+- Marathi written in English letters
+- Hindi
+- English
+
+Always reply in the same language used by the user.
+
+Examples:
+
+User:
+"आज किती दूध जमा झालं?"
+
+Reply naturally in Marathi.
+
+User:
+"aaj kiti dudh jama zala?"
+
+Reply naturally in Marathi/Marathi-English.
+
+User:
+"How much milk was collected today?"
+
+Reply in English.
+
+==============================================================
+IMPORTANT DATABASE RULE
+==============================================================
+
+You have access to controlled DairyMitr database tools.
+
+When the user asks for ACTUAL DairyMitr data:
+
+NEVER invent numbers.
+
+NEVER guess records.
+
+NEVER create fake vendors.
+
+NEVER create fake payments.
+
+NEVER create fake milk collection.
+
+NEVER create fake advance.
+
+NEVER create fake food sack data.
+
+Use the appropriate database tool.
+
+Only use information returned by the database tool.
+
+If the required database information is unavailable,
+clearly tell the user that the required data is unavailable.
+
+==============================================================
+AVAILABLE DATABASE CAPABILITIES
+==============================================================
+
+You have controlled tools for:
+
+1. Today's milk
+2. Date-wise milk collection
+3. Vendor-wise milk
+4. Vendor information
+5. Vendor count
+6. Vendor summary
+7. Payments
+8. Advance
+9. Food sack
+10. Dairy daily summary
+11. Dairy monthly summary
+12. Dairy performance
+
+==============================================================
+MILK COLLECTION
+==============================================================
+
+Use milk tools for questions such as:
+
+- आज किती दूध जमा झालं?
+- आजचे दूध किती आहे?
+- morning milk किती?
+- evening milk किती?
+- cow milk किती?
+- buffalo milk किती?
+- आजचे cow आणि buffalo milk किती?
+- काल किती दूध जमा झाले?
+- या महिन्यात किती दूध जमा झाले?
+- vendor wise milk
+- vendor X ने किती दूध दिले?
+- date wise milk collection
+
+For actual numbers use database tools.
+
+==============================================================
+VENDORS
+==============================================================
+
+Use vendor tools for:
+
+- माझ्याकडे किती vendors आहेत?
+- माझे vendors किती आहेत?
+- vendor list
+- सर्व vendors दाखवा
+- vendor ची माहिती
+- vendor X ची माहिती
+- vendor wise summary
+
+Do not expose bank account or IFSC information unless
+specifically required and authorized.
+
+==============================================================
+PAYMENTS
+==============================================================
+
+Use payment tools for:
+
+- आज किती payment झाले?
+- total payment
+- vendor payment
+- pending payment
+- vendor X ला किती payment?
+- या महिन्याचा payment
+- payment summary
+
+Use only actual database values.
+
+==============================================================
+ADVANCE
+==============================================================
+
+Use advance tools for:
+
+- total advance
+- vendor advance
+- vendor X ने किती advance घेतला?
+- आजचा advance
+- advance summary
+
+==============================================================
+FOOD SACK
+==============================================================
+
+Use food sack tools for:
+
+- किती food sack दिले?
+- total sack
+- vendor wise sack
+- sack amount
+- आजचे sack
+- monthly sack summary
+
+==============================================================
+REPORTS
+==============================================================
+
+Use report tools for:
+
+- आजचा dairy report
+- daily summary
+- monthly summary
+- dairy performance
+- today's business summary
+- महिन्याचा summary
+
+Present reports clearly.
+
+==============================================================
+SECURITY
+==============================================================
+
+Never reveal:
+
+- database password
+- database credentials
+- API key
+- Flask secret key
+- session secrets
+- SQL credentials
+- internal implementation details
+
+Never execute arbitrary SQL supplied by the user.
+
+Never access another dairy owner's records.
+
+All database queries MUST be restricted to:
+
+session['id']
+
+which represents the current DairyMitr owner/user.
+
+==============================================================
+RESPONSE STYLE
+==============================================================
+
+Be:
+
+- helpful
+- professional
+- friendly
+- concise
+- easy to understand
+
+Use emojis when useful.
+
+For numerical reports use clean formatting.
+
+Example:
+
+📊 आजचा Dairy Report
+
+🥛 दूध:
+Morning: 120 L
+Evening: 105 L
+Total: 225 L
+
+👨‍🌾 Vendors:
+Total: 48
+
+💰 Payment:
+₹XX,XXX
+
+💳 Advance:
+₹X,XXX
+
+🌾 Food Sack:
+XX sacks
+
+==============================================================
+IMPORTANT
+==============================================================
+
+Never claim database access unless a database tool actually
+returned the requested data.
+
+If a tool returns no records, say that no records were found.
+
+Do not invent missing values.
+
+"""
+
+
+# ==========================================================
+# 2. COMMON AI SECURITY HELPER
+# ==========================================================
+
+def dairymitr_ai_get_user_id():
+
+    if not session.get("loggedin"):
+        return None
+
+    if session.get("role") not in ("owner", "staff"):
+        return None
+
+    user_id = session.get("id")
+
+    try:
+        return int(user_id)
+
+    except (TypeError, ValueError):
+        return None
+
+
+# ==========================================================
+# 3. DATE HELPER
+# ==========================================================
+
+def dairymitr_ai_today():
+
+    return datetime.now(
+        ZoneInfo("Asia/Kolkata")
+    ).date()
+
+
+# ==========================================================
+# 4. TODAY'S MILK
+# ==========================================================
+
+def get_today_milk():
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                slot,
+                milk_type,
+                SUM(quantity) AS total_quantity
+            FROM milk_collection
+            WHERE
+                user_id=%s
+                AND DATE(date)=%s
+            GROUP BY
+                slot,
+                milk_type
+            ORDER BY
+                slot,
+                milk_type
+            """,
+            (
+                user_id,
+                today
+            )
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        morning_cow = 0.0
+        morning_buffalo = 0.0
+
+        evening_cow = 0.0
+        evening_buffalo = 0.0
+
+        for row in rows:
+
+            slot = str(
+                row.get("slot") or ""
+            ).lower().strip()
+
+            milk_type = str(
+                row.get("milk_type") or ""
+            ).lower().strip()
+
+            quantity = float(
+                row.get("total_quantity") or 0
+            )
+
+            if slot == "morning":
+
+                if milk_type == "cow":
+                    morning_cow += quantity
+
+                elif milk_type == "buffalo":
+                    morning_buffalo += quantity
+
+            elif slot == "evening":
+
+                if milk_type == "cow":
+                    evening_cow += quantity
+
+                elif milk_type == "buffalo":
+                    evening_buffalo += quantity
+
+        morning_total = (
+            morning_cow +
+            morning_buffalo
+        )
+
+        evening_total = (
+            evening_cow +
+            evening_buffalo
+        )
+
+        total = (
+            morning_total +
+            evening_total
+        )
+
+        return {
+
+            "success": True,
+
+            "date": str(today),
+
+            "morning": {
+                "cow_liters": round(
+                    morning_cow, 2
+                ),
+                "buffalo_liters": round(
+                    morning_buffalo, 2
+                ),
+                "total_liters": round(
+                    morning_total, 2
+                )
+            },
+
+            "evening": {
+                "cow_liters": round(
+                    evening_cow, 2
+                ),
+                "buffalo_liters": round(
+                    evening_buffalo, 2
+                ),
+                "total_liters": round(
+                    evening_total, 2
+                )
+            },
+
+            "total_liters": round(
+                total, 2
+            )
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_today_milk failed"
+        )
+
+        return {
+            "success": False,
+            "error": "Unable to retrieve today's milk."
+        }
+
+
+# ==========================================================
+# 5. DATE-WISE MILK COLLECTION
+# ==========================================================
+
+def get_milk_collection(
+    start_date="",
+    end_date="",
+    vendor_name="",
+    slot="",
+    milk_type=""
+):
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        if not start_date:
+            start_date = str(today)
+
+        if not end_date:
+            end_date = start_date
+
+        query = """
+            SELECT
+                mc.date,
+                mc.slot,
+                mc.milk_type,
+                SUM(mc.quantity) AS total_quantity,
+                mc.vendor_id,
+                v.name AS vendor_name
+            FROM milk_collection mc
+            LEFT JOIN vendors v
+                ON v.vendor_id = mc.vendor_id
+                AND v.user_id = mc.user_id
+            WHERE
+                mc.user_id=%s
+                AND DATE(mc.date) BETWEEN %s AND %s
+        """
+
+        params = [
+            user_id,
+            start_date,
+            end_date
+        ]
+
+        if vendor_name:
+
+            query += """
+                AND (
+                    v.name LIKE %s
+                    OR v.name_en LIKE %s
+                )
+            """
+
+            search = f"%{vendor_name}%"
+
+            params.extend([
+                search,
+                search
+            ])
+
+        if slot:
+
+            query += """
+                AND LOWER(mc.slot)=LOWER(%s)
+            """
+
+            params.append(slot)
+
+        if milk_type:
+
+            query += """
+                AND LOWER(mc.milk_type)=LOWER(%s)
+            """
+
+            params.append(milk_type)
+
+        query += """
+            GROUP BY
+                mc.date,
+                mc.slot,
+                mc.milk_type,
+                mc.vendor_id,
+                v.name
+            ORDER BY
+                mc.date DESC,
+                mc.slot ASC
+        """
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        cursor.execute(
+            query,
+            tuple(params)
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        result = []
+
+        total = 0.0
+
+        for row in rows:
+
+            quantity = float(
+                row.get("total_quantity") or 0
+            )
+
+            total += quantity
+
+            result.append({
+
+                "date": str(
+                    row.get("date")
+                ),
+
+                "slot": row.get("slot"),
+
+                "milk_type": row.get(
+                    "milk_type"
+                ),
+
+                "vendor_id": row.get(
+                    "vendor_id"
+                ),
+
+                "vendor_name": row.get(
+                    "vendor_name"
+                ),
+
+                "quantity_liters": round(
+                    quantity,
+                    2
+                )
+            })
+
+        return {
+
+            "success": True,
+
+            "start_date": str(start_date),
+
+            "end_date": str(end_date),
+
+            "records": result,
+
+            "record_count": len(result),
+
+            "total_liters": round(
+                total,
+                2
+            )
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_milk_collection failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to retrieve milk collection."
+        }
+
+
+# ==========================================================
+# 6. VENDORS
+# ==========================================================
+
+def get_vendors():
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                vendor_id,
+                name,
+                name_en,
+                address,
+                milk_type,
+                phone
+            FROM vendors
+            WHERE user_id=%s
+            ORDER BY name ASC
+            """,
+            (user_id,)
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        vendors = []
+
+        for row in rows:
+
+            vendors.append({
+
+                "vendor_id":
+                    row.get("vendor_id"),
+
+                "name":
+                    row.get("name"),
+
+                "name_en":
+                    row.get("name_en"),
+
+                "address":
+                    row.get("address"),
+
+                "milk_type":
+                    row.get("milk_type"),
+
+                "phone":
+                    row.get("phone")
+            })
+
+        return {
+
+            "success": True,
+
+            "total_vendors":
+                len(vendors),
+
+            "vendors":
+                vendors
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_vendors failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to retrieve vendor data."
+        }
+
+
+# ==========================================================
+# 7. VENDOR SUMMARY
+# ==========================================================
+
+def get_vendor_summary(
+    vendor_name="",
+    start_date="",
+    end_date=""
+):
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        if not vendor_name:
+
+            return {
+                "success": False,
+                "error": "Vendor name is required."
+            }
+
+        today = dairymitr_ai_today()
+
+        if not start_date:
+            start_date = str(today)
+
+        if not end_date:
+            end_date = start_date
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        search = f"%{vendor_name}%"
+
+        cursor.execute(
+            """
+            SELECT
+                v.vendor_id,
+                v.name,
+                v.name_en,
+                v.address,
+                v.milk_type,
+                v.phone,
+
+                COALESCE(
+                    SUM(mc.quantity),
+                    0
+                ) AS total_milk
+
+            FROM vendors v
+
+            LEFT JOIN milk_collection mc
+                ON mc.vendor_id=v.vendor_id
+                AND mc.user_id=v.user_id
+                AND DATE(mc.date)
+                    BETWEEN %s AND %s
+
+            WHERE
+                v.user_id=%s
+                AND (
+                    v.name LIKE %s
+                    OR v.name_en LIKE %s
+                )
+
+            GROUP BY
+                v.vendor_id,
+                v.name,
+                v.name_en,
+                v.address,
+                v.milk_type,
+                v.phone
+
+            ORDER BY
+                total_milk DESC
+
+            LIMIT 20
+            """,
+            (
+                start_date,
+                end_date,
+                user_id,
+                search,
+                search
+            )
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        result = []
+
+        for row in rows:
+
+            result.append({
+
+                "vendor_id":
+                    row.get("vendor_id"),
+
+                "name":
+                    row.get("name"),
+
+                "name_en":
+                    row.get("name_en"),
+
+                "address":
+                    row.get("address"),
+
+                "milk_type":
+                    row.get("milk_type"),
+
+                "phone":
+                    row.get("phone"),
+
+                "total_milk_liters":
+                    round(
+                        float(
+                            row.get(
+                                "total_milk"
+                            ) or 0
+                        ),
+                        2
+                    )
+            })
+
+        return {
+
+            "success": True,
+
+            "start_date":
+                str(start_date),
+
+            "end_date":
+                str(end_date),
+
+            "vendors":
+                result
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_vendor_summary failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to retrieve vendor summary."
+        }
+
+
+# ==========================================================
+# 8. PAYMENT TOOL
+# ==========================================================
+
+def get_payments(
+    start_date="",
+    end_date="",
+    vendor_name=""
+):
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        if not start_date:
+            start_date = str(today)
+
+        if not end_date:
+            end_date = start_date
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        # First inspect known payment columns safely.
+        cursor.execute(
+            """
+            SELECT
+                COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'payments'
+            ORDER BY ORDINAL_POSITION
+            """
+        )
+
+        columns = [
+            row.get("COLUMN_NAME")
+            for row in cursor.fetchall()
+        ]
+
+        # Known safe candidates.
+        date_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "date",
+                    "payment_date",
+                    "created_at"
+                )
+            ),
+            None
+        )
+
+        amount_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "amount",
+                    "payment_amount",
+                    "total_amount",
+                    "paid_amount"
+                )
+            ),
+            None
+        )
+
+        vendor_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "vendor_id",
+                    "vendorid"
+                )
+            ),
+            None
+        )
+
+        if not date_col or not amount_col:
+
+            cursor.close()
+
+            return {
+                "success": False,
+                "error":
+                    "Payment date/amount columns were not found."
+            }
+
+        # Column names come ONLY from INFORMATION_SCHEMA,
+        # not from user input.
+        query = f"""
+            SELECT
+                p.`{date_col}` AS payment_date,
+                p.`{amount_col}` AS payment_amount
+        """
+
+        if vendor_col:
+            query += f""",
+                p.`{vendor_col}` AS vendor_id,
+                v.name AS vendor_name
+            """
+
+        query += f"""
+            FROM payments p
+        """
+
+        if vendor_col:
+
+            query += f"""
+                LEFT JOIN vendors v
+                    ON v.vendor_id =
+                       p.`{vendor_col}`
+                    AND v.user_id = %s
+            """
+
+        query += f"""
+            WHERE p.user_id=%s
+              AND DATE(p.`{date_col}`)
+                  BETWEEN %s AND %s
+        """
+
+        params = []
+
+        if vendor_col:
+            params.append(user_id)
+
+        params.extend([
+            user_id,
+            start_date,
+            end_date
+        ])
+
+        if vendor_name and vendor_col:
+
+            query += """
+                AND (
+                    v.name LIKE %s
+                    OR v.name_en LIKE %s
+                )
+            """
+
+            search = f"%{vendor_name}%"
+
+            params.extend([
+                search,
+                search
+            ])
+
+        query += f"""
+            ORDER BY
+                p.`{date_col}` DESC
+        """
+
+        cursor.execute(
+            query,
+            tuple(params)
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        records = []
+
+        total = 0.0
+
+        for row in rows:
+
+            amount = float(
+                row.get(
+                    "payment_amount"
+                ) or 0
+            )
+
+            total += amount
+
+            records.append({
+
+                "date":
+                    str(
+                        row.get(
+                            "payment_date"
+                        )
+                    ),
+
+                "amount":
+                    round(
+                        amount,
+                        2
+                    ),
+
+                "vendor_id":
+                    row.get(
+                        "vendor_id"
+                    ),
+
+                "vendor_name":
+                    row.get(
+                        "vendor_name"
+                    )
+            })
+
+        return {
+
+            "success": True,
+
+            "start_date":
+                str(start_date),
+
+            "end_date":
+                str(end_date),
+
+            "total_payment":
+                round(
+                    total,
+                    2
+                ),
+
+            "records":
+                records,
+
+            "record_count":
+                len(records)
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_payments failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to retrieve payment data."
+        }
+
+
+# ==========================================================
+# 9. ADVANCE TOOL
+# ==========================================================
+
+def get_advance(
+    start_date="",
+    end_date="",
+    vendor_name=""
+):
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        if not start_date:
+            start_date = str(today)
+
+        if not end_date:
+            end_date = start_date
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'advance'
+            ORDER BY ORDINAL_POSITION
+            """
+        )
+
+        columns = [
+            row.get("COLUMN_NAME")
+            for row in cursor.fetchall()
+        ]
+
+        date_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "date",
+                    "advance_date",
+                    "created_at"
+                )
+            ),
+            None
+        )
+
+        amount_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "amount",
+                    "advance_amount"
+                )
+            ),
+            None
+        )
+
+        vendor_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "vendor_id",
+                    "vendorid"
+                )
+            ),
+            None
+        )
+
+        if not date_col or not amount_col:
+
+            cursor.close()
+
+            return {
+
+                "success": False,
+
+                "error":
+                    "Advance date/amount columns were not found."
+            }
+
+        query = f"""
+            SELECT
+                a.`{date_col}` AS advance_date,
+                a.`{amount_col}` AS advance_amount
+        """
+
+        if vendor_col:
+
+            query += f""",
+                a.`{vendor_col}` AS vendor_id,
+                v.name AS vendor_name
+            """
+
+        query += """
+            FROM advance a
+        """
+
+        if vendor_col:
+
+            query += f"""
+                LEFT JOIN vendors v
+                    ON v.vendor_id =
+                       a.`{vendor_col}`
+                    AND v.user_id=%s
+            """
+
+        query += f"""
+            WHERE a.user_id=%s
+              AND DATE(a.`{date_col}`)
+                  BETWEEN %s AND %s
+        """
+
+        params = []
+
+        if vendor_col:
+            params.append(user_id)
+
+        params.extend([
+            user_id,
+            start_date,
+            end_date
+        ])
+
+        if vendor_name and vendor_col:
+
+            query += """
+                AND (
+                    v.name LIKE %s
+                    OR v.name_en LIKE %s
+                )
+            """
+
+            search = f"%{vendor_name}%"
+
+            params.extend([
+                search,
+                search
+            ])
+
+        query += f"""
+            ORDER BY
+                a.`{date_col}` DESC
+        """
+
+        cursor.execute(
+            query,
+            tuple(params)
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        records = []
+
+        total = 0.0
+
+        for row in rows:
+
+            amount = float(
+                row.get(
+                    "advance_amount"
+                ) or 0
+            )
+
+            total += amount
+
+            records.append({
+
+                "date":
+                    str(
+                        row.get(
+                            "advance_date"
+                        )
+                    ),
+
+                "amount":
+                    round(
+                        amount,
+                        2
+                    ),
+
+                "vendor_id":
+                    row.get(
+                        "vendor_id"
+                    ),
+
+                "vendor_name":
+                    row.get(
+                        "vendor_name"
+                    )
+            })
+
+        return {
+
+            "success": True,
+
+            "start_date":
+                str(start_date),
+
+            "end_date":
+                str(end_date),
+
+            "total_advance":
+                round(
+                    total,
+                    2
+                ),
+
+            "records":
+                records
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_advance failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to retrieve advance data."
+        }
+
+
+# ==========================================================
+# 10. FOOD SACK TOOL
+# ==========================================================
+
+def get_food_sack(
+    start_date="",
+    end_date="",
+    vendor_name=""
+):
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        if not start_date:
+            start_date = str(today)
+
+        if not end_date:
+            end_date = start_date
+
+        cursor = SafeCursor(
+            mysql.connection.cursor()
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'food_sack'
+            ORDER BY ORDINAL_POSITION
+            """
+        )
+
+        columns = [
+            row.get("COLUMN_NAME")
+            for row in cursor.fetchall()
+        ]
+
+        date_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "date",
+                    "sack_date",
+                    "created_at"
+                )
+            ),
+            None
+        )
+
+        qty_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "quantity",
+                    "qty",
+                    "sack_quantity",
+                    "sacks",
+                    "food_sack"
+                )
+            ),
+            None
+        )
+
+        amount_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "amount",
+                    "total_amount",
+                    "payment"
+                )
+            ),
+            None
+        )
+
+        vendor_col = next(
+            (
+                c for c in columns
+                if c.lower()
+                in (
+                    "vendor_id",
+                    "vendorid"
+                )
+            ),
+            None
+        )
+
+        if not date_col or not qty_col:
+
+            cursor.close()
+
+            return {
+
+                "success": False,
+
+                "error":
+                    "Food sack date/quantity columns were not found."
+            }
+
+        query = f"""
+            SELECT
+                fs.`{date_col}` AS sack_date,
+                fs.`{qty_col}` AS sack_quantity
+        """
+
+        if amount_col:
+
+            query += f""",
+                fs.`{amount_col}` AS sack_amount
+            """
+
+        else:
+
+            query += """
+                NULL AS sack_amount
+            """
+
+        if vendor_col:
+
+            query += f""",
+                fs.`{vendor_col}` AS vendor_id,
+                v.name AS vendor_name
+            """
+
+        query += """
+            FROM food_sack fs
+        """
+
+        if vendor_col:
+
+            query += f"""
+                LEFT JOIN vendors v
+                    ON v.vendor_id =
+                       fs.`{vendor_col}`
+                    AND v.user_id=%s
+            """
+
+        query += f"""
+            WHERE fs.user_id=%s
+              AND DATE(fs.`{date_col}`)
+                  BETWEEN %s AND %s
+        """
+
+        params = []
+
+        if vendor_col:
+            params.append(user_id)
+
+        params.extend([
+            user_id,
+            start_date,
+            end_date
+        ])
+
+        if vendor_name and vendor_col:
+
+            query += """
+                AND (
+                    v.name LIKE %s
+                    OR v.name_en LIKE %s
+                )
+            """
+
+            search = f"%{vendor_name}%"
+
+            params.extend([
+                search,
+                search
+            ])
+
+        query += f"""
+            ORDER BY
+                fs.`{date_col}` DESC
+        """
+
+        cursor.execute(
+            query,
+            tuple(params)
+        )
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        total_quantity = 0.0
+        total_amount = 0.0
+
+        records = []
+
+        for row in rows:
+
+            quantity = float(
+                row.get(
+                    "sack_quantity"
+                ) or 0
+            )
+
+            amount = float(
+                row.get(
+                    "sack_amount"
+                ) or 0
+            )
+
+            total_quantity += quantity
+            total_amount += amount
+
+            records.append({
+
+                "date":
+                    str(
+                        row.get(
+                            "sack_date"
+                        )
+                    ),
+
+                "quantity":
+                    round(
+                        quantity,
+                        2
+                    ),
+
+                "amount":
+                    round(
+                        amount,
+                        2
+                    ),
+
+                "vendor_id":
+                    row.get(
+                        "vendor_id"
+                    ),
+
+                "vendor_name":
+                    row.get(
+                        "vendor_name"
+                    )
+            })
+
+        return {
+
+            "success": True,
+
+            "start_date":
+                str(start_date),
+
+            "end_date":
+                str(end_date),
+
+            "total_sacks":
+                round(
+                    total_quantity,
+                    2
+                ),
+
+            "total_amount":
+                round(
+                    total_amount,
+                    2
+                ),
+
+            "records":
+                records
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_food_sack failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to retrieve food sack data."
+        }
+
+
+# ==========================================================
+# 11. DAILY SUMMARY
+# ==========================================================
+
+def get_daily_summary():
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        milk = get_today_milk()
+
+        payments = get_payments(
+            str(today),
+            str(today)
+        )
+
+        advance = get_advance(
+            str(today),
+            str(today)
+        )
+
+        food = get_food_sack(
+            str(today),
+            str(today)
+        )
+
+        vendors = get_vendors()
+
+        return {
+
+            "success": True,
+
+            "date":
+                str(today),
+
+            "milk":
+                milk,
+
+            "payments":
+                payments,
+
+            "advance":
+                advance,
+
+            "food_sack":
+                food,
+
+            "vendors":
+                {
+                    "total":
+                        vendors.get(
+                            "total_vendors",
+                            0
+                        )
+                }
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_daily_summary failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to create daily summary."
+        }
+
+
+# ==========================================================
+# 12. MONTHLY SUMMARY
+# ==========================================================
+
+def get_monthly_summary(
+    year="",
+    month=""
+):
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        if not year:
+            year = today.year
+
+        if not month:
+            month = today.month
+
+        year = int(year)
+        month = int(month)
+
+        start = date(
+            year,
+            month,
+            1
+        )
+
+        if month == 12:
+
+            end = date(
+                year + 1,
+                1,
+                1
+            ) - timedelta(
+                days=1
+            )
+
+        else:
+
+            end = date(
+                year,
+                month + 1,
+                1
+            ) - timedelta(
+                days=1
+            )
+
+        start_string = str(start)
+        end_string = str(end)
+
+        milk = get_milk_collection(
+            start_string,
+            end_string
+        )
+
+        payments = get_payments(
+            start_string,
+            end_string
+        )
+
+        advance = get_advance(
+            start_string,
+            end_string
+        )
+
+        food = get_food_sack(
+            start_string,
+            end_string
+        )
+
+        return {
+
+            "success": True,
+
+            "year":
+                year,
+
+            "month":
+                month,
+
+            "start_date":
+                start_string,
+
+            "end_date":
+                end_string,
+
+            "milk":
+                milk,
+
+            "payments":
+                payments,
+
+            "advance":
+                advance,
+
+            "food_sack":
+                food
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_monthly_summary failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to create monthly summary."
+        }
+
+
+# ==========================================================
+# 13. DAIRY PERFORMANCE
+# ==========================================================
+
+def get_dairy_performance():
+
+    try:
+
+        user_id = dairymitr_ai_get_user_id()
+
+        if not user_id:
+
+            return {
+                "success": False,
+                "error": "Unauthorized access."
+            }
+
+        today = dairymitr_ai_today()
+
+        month_start = date(
+            today.year,
+            today.month,
+            1
+        )
+
+        milk = get_milk_collection(
+            str(month_start),
+            str(today)
+        )
+
+        vendors = get_vendors()
+
+        return {
+
+            "success": True,
+
+            "period": {
+                "start":
+                    str(month_start),
+
+                "end":
+                    str(today)
+            },
+
+            "total_vendors":
+                vendors.get(
+                    "total_vendors",
+                    0
+                ),
+
+            "milk":
+                milk
+        }
+
+    except Exception:
+
+        logging.exception(
+            "get_dairy_performance failed"
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                "Unable to create dairy performance report."
+        }
+
+
+# ==========================================================
+# 14. DAIRYMITR AI CHAT API
+# ==========================================================
+
+@app.route(
+    "/api/chat",
+    methods=["POST"]
+)
+def dairy_mitr_ai_chat():
+
+    # ======================================================
+    # LOGIN
+    # ======================================================
+
+    if not session.get("loggedin"):
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "Please login first."
+
+        }), 401
+
+
+    # ======================================================
+    # ROLE
+    # ======================================================
+
+    if session.get("role") not in (
+        "owner",
+        "staff"
+    ):
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "You are not authorized to use DairyMitr AI."
+
+        }), 403
+
+
+    # ======================================================
+    # GEMINI
+    # ======================================================
+
+    if gemini_client is None:
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "Gemini AI is not configured. "
+                "Please check GEMINI_API_KEY."
+
+        }), 500
+
+
+    # ======================================================
+    # REQUEST
+    # ======================================================
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    message = str(
+        data.get(
+            "message",
+            ""
+        )
+    ).strip()
+
+
+    if not message:
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "Please enter a message."
+
+        }), 400
+
+
+    if len(message) > 4000:
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "Message is too long."
+
+        }), 400
+
+
+    # ======================================================
+    # GEMINI
+    # ======================================================
+
+    try:
+
+        logging.info(
+            "DairyMitr AI request | user_id=%s",
+            session.get("id")
+        )
+
+
+        chat = gemini_client.chats.create(
+
+            model=GEMINI_MODEL,
+
+            config=types.GenerateContentConfig(
+
+                system_instruction=
+                    DAIRYMITR_AI_INSTRUCTION,
+
+                temperature=0.2,
+
+                tools=[
+
+                    get_today_milk,
+
+                    get_milk_collection,
+
+                    get_vendors,
+
+                    get_vendor_summary,
+
+                    get_payments,
+
+                    get_advance,
+
+                    get_food_sack,
+
+                    get_daily_summary,
+
+                    get_monthly_summary,
+
+                    get_dairy_performance
+                ]
+            )
+        )
+
+
+        response = chat.send_message(
+            message
+        )
+
+
+        ai_response = ""
+
+        try:
+
+            ai_response = (
+                response.text or ""
+            ).strip()
+
+        except Exception:
+
+            logging.exception(
+                "Gemini response extraction failed"
+            )
+
+
+        if not ai_response:
+
+            ai_response = (
+                "माफ करा, मला यावेळी योग्य "
+                "उत्तर तयार करता आले नाही."
+            )
+
+
+        # ==================================================
+        # AUDIT
+        # ==================================================
+
+        try:
+
+            audit_log(
+
+                session.get("id"),
+
+                "dairymitr_ai_chat",
+
+                f"message_length={len(message)}"
+
+            )
+
+        except Exception:
+
+            logging.exception(
+                "AI audit log failed"
+            )
+
+
+        return jsonify({
+
+            "success": True,
+
+            "reply":
+                ai_response,
+
+            "response":
+                ai_response
+
+        }), 200
+
+
+    except Exception as e:
+
+        logging.exception(
+            "DairyMitr AI error"
+        )
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                f"DairyMitr AI error: {str(e)}"
+
+        }), 500
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# DAIRYMITR - FAT / SNF BACKEND
+# Chart Management + Rate Lookup + Milk Collection + Edit
+# Calculation Mode
+# ============================================================
+
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import date, datetime
+
+from flask import (
+    request,
+    jsonify,
+    render_template,
+    redirect,
+    url_for,
+    session,
+)
+
+# Existing project मध्ये mysql आणि SafeCursor आधीच defined असतील,
+# तर त्यांचे imports पुन्हा करू नकोस.
+
+
+# ============================================================
+# 1. COMMON HELPERS
+# ============================================================
+
+def fsn_current_user_id():
+    """Get the logged-in user ID from the existing session."""
+
+    if not session.get("loggedin"):
+        return None
+
+    if session.get("role") not in ("owner", "staff"):
+        return None
+
+    try:
+        user_id = int(session.get("id"))
+        return user_id if user_id > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fsn_decimal(value, field_name):
+    """Convert a value to a finite Decimal."""
+
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{field_name} is required.")
+
+    try:
+        result = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(f"Invalid {field_name}.")
+
+    if not result.is_finite():
+        raise ValueError(f"Invalid {field_name}.")
+
+    return result
+
+
+def fsn_validate_fat(value):
+    result = fsn_decimal(value, "FAT")
+
+    if result < 0 or result > 100:
+        raise ValueError("FAT must be between 0 and 100.")
+
+    return result.quantize(Decimal("0.01"))
+
+
+def fsn_validate_snf(value):
+    result = fsn_decimal(value, "SNF")
+
+    if result < 0 or result > 100:
+        raise ValueError("SNF must be between 0 and 100.")
+
+    return result.quantize(Decimal("0.01"))
+
+
+def fsn_validate_rate(value):
+    result = fsn_decimal(value, "Rate")
+
+    if result < 0 or result > Decimal("99999999"):
+        raise ValueError("Invalid rate.")
+
+    return result.quantize(Decimal("0.01"))
+
+
+def fsn_validate_quantity(value):
+    result = fsn_decimal(value, "Quantity")
+
+    if result <= 0 or result > Decimal("99999999"):
+        raise ValueError("Quantity must be greater than zero.")
+
+    return result.quantize(Decimal("0.01"))
+
+
+def fsn_money(value):
+    """Round monetary values to two decimal places."""
+
+    return Decimal(str(value)).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP
+    )
+
+
+def fsn_json_value(value):
+    """Convert Decimal and date values into JSON-compatible values."""
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+
+    return value
+
+
+def fsn_row_dict(row):
+    """Convert a dictionary or tuple cursor row into a dictionary."""
+
+    if row is None:
+        return None
+
+    if isinstance(row, dict):
+        return {
+            key: fsn_json_value(value)
+            for key, value in row.items()
+        }
+
+    raise TypeError(
+        "Expected dictionary cursor rows. "
+        "Check your existing MySQL cursor configuration."
+    )
+
+
+def fsn_error(message, status=400):
+    return jsonify({
+        "success": False,
+        "message": message
+    }), status
+
+
+def fsn_get_json():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        raise ValueError("A valid JSON request body is required.")
+
+    return data
+
+
+def fsn_parse_date(value):
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        raise ValueError("Invalid date. Use YYYY-MM-DD.")
+
+
+def fsn_get_cursor():
+    """Use the project's existing database connection and wrapper."""
+
+    return SafeCursor(mysql.connection.cursor())
+
+
+# ============================================================
+# 2. CHART OWNERSHIP HELPER
+# ============================================================
+
+def fsn_fetch_chart(chart_id, user_id, cursor):
+    """Fetch a chart only when it belongs to this user."""
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            user_id,
+            created_by_staff_id,
+            chart_name,
+            milk_type,
+            effective_from,
+            status,
+            created_at,
+            updated_at
+        FROM fat_snf_charts
+        WHERE id = %s
+          AND user_id = %s
+        LIMIT 1
+        """,
+        (chart_id, user_id)
+    )
+
+    return cursor.fetchone()
+
+
+# ============================================================
+# 3. FIND APPLICABLE CHART AND EXACT MATRIX RATE
+# ============================================================
+
+def fsn_find_rate(user_id, milk_type, fat, snf, collection_date, cursor):
+    """
+    Find the active chart effective on the collection date.
+    A specific milk-type chart has priority over a 'both' chart.
+    FAT and SNF must exactly match a saved matrix cell.
+    """
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            chart_name,
+            milk_type,
+            effective_from
+        FROM fat_snf_charts
+        WHERE user_id = %s
+          AND status = 'active'
+          AND effective_from <= %s
+          AND milk_type IN (%s, 'both')
+        ORDER BY
+            CASE WHEN milk_type = %s THEN 0 ELSE 1 END,
+            effective_from DESC,
+            id DESC
+        LIMIT 1
+        """,
+        (
+            user_id,
+            collection_date,
+            milk_type,
+            milk_type
+        )
+    )
+
+    chart = cursor.fetchone()
+
+    if not chart:
+        raise ValueError(
+            "No active FAT/SNF rate chart exists for this date and milk type."
+        )
+
+    cursor.execute(
+        """
+        SELECT id, rate
+        FROM fat_snf_chart_values
+        WHERE chart_id = %s
+          AND fat = %s
+          AND snf = %s
+        LIMIT 1
+        """,
+        (
+            chart["id"],
+            fat,
+            snf
+        )
+    )
+
+    cell = cursor.fetchone()
+
+    if not cell:
+        raise ValueError(
+            f"No rate found for FAT {fat} and SNF {snf}. "
+            "Check the selected rate chart."
+        )
+
+    return {
+        "chart_id": chart["id"],
+        "chart_name": chart["chart_name"],
+        "chart_value_id": cell["id"],
+        "rate": fsn_money(cell["rate"])
+    }
+
+
+# ============================================================
+# 4. RATE CHART LIST PAGE
+# Template: templates/fat_snf/rate_chart.html
+# ============================================================
+
+@app.route("/fat_snf/rate-chart", methods=["GET"])
+def fat_snf_rate_chart():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return redirect(url_for("login"))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                chart_name,
+                milk_type,
+                effective_from,
+                status,
+                created_at,
+                updated_at
+            FROM fat_snf_charts
+            WHERE user_id = %s
+            ORDER BY effective_from DESC, id DESC
+            """,
+            (user_id,)
+        )
+
+        charts = cursor.fetchall()
+
+        return render_template(
+            "fat_snf/rate_chart.html",
+            charts=charts
+        )
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 5. CREATE CHART PAGE
+# Template: templates/fat_snf/create_chart.html
+# ============================================================
+
+@app.route("/fat_snf/rate-chart/create", methods=["GET"])
+def create_fat_snf_chart_page():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return redirect(url_for("login"))
+
+    return render_template("fat_snf/create_chart.html")
+
+
+# ============================================================
+# 6. CREATE / SAVE RATE CHART API
+# POST /api/fat_snf/charts/create
+# ============================================================
+
+@app.route("/api/fat_snf/charts/create", methods=["POST"])
+def create_fat_snf_chart():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    try:
+        data = fsn_get_json()
+
+        chart_name = str(data.get("chart_name", "")).strip()
+        milk_type = str(data.get("milk_type", "")).strip().lower()
+        effective_date = fsn_parse_date(data.get("effective_date"))
+        fat_values = data.get("fat_values")
+        snf_values = data.get("snf_values")
+        matrix = data.get("matrix")
+
+        if not chart_name or len(chart_name) > 150:
+            raise ValueError("Chart name is required (maximum 150 characters).")
+
+        if milk_type not in ("cow", "buffalo", "both"):
+            raise ValueError("Invalid milk type.")
+
+        if not isinstance(fat_values, list) or not fat_values:
+            raise ValueError("FAT values are required.")
+
+        if not isinstance(snf_values, list) or not snf_values:
+            raise ValueError("SNF values are required.")
+
+        if not isinstance(matrix, list) or not matrix:
+            raise ValueError("Rate matrix is required.")
+
+        if len(fat_values) > 50 or len(snf_values) > 50:
+            raise ValueError("The matrix dimensions are too large.")
+
+        if len(matrix) > 2500:
+            raise ValueError("The matrix cannot contain more than 2500 cells.")
+
+        fats = [fsn_validate_fat(value) for value in fat_values]
+        snfs = [fsn_validate_snf(value) for value in snf_values]
+
+        if len(set(fats)) != len(fats):
+            raise ValueError("Duplicate FAT values are not allowed.")
+
+        if len(set(snfs)) != len(snfs):
+            raise ValueError("Duplicate SNF values are not allowed.")
+
+        expected_cells = len(fats) * len(snfs)
+
+        if len(matrix) != expected_cells:
+            raise ValueError("The matrix must contain every FAT/SNF combination.")
+
+        expected_pairs = {
+            (fat, snf)
+            for fat in fats
+            for snf in snfs
+        }
+
+        cleaned_matrix = []
+        seen_pairs = set()
+
+        for item in matrix:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid matrix cell.")
+
+            fat = fsn_validate_fat(item.get("fat"))
+            snf = fsn_validate_snf(item.get("snf"))
+            rate = fsn_validate_rate(item.get("rate"))
+
+            pair = (fat, snf)
+
+            if pair in seen_pairs:
+                raise ValueError("Duplicate FAT/SNF matrix cell.")
+
+            if pair not in expected_pairs:
+                raise ValueError("Matrix contains unexpected FAT/SNF values.")
+
+            seen_pairs.add(pair)
+
+            cleaned_matrix.append((fat, snf, rate))
+
+        if seen_pairs != expected_pairs:
+            raise ValueError("Some FAT/SNF matrix cells are missing.")
+
+    except ValueError as exc:
+        return fsn_error(str(exc))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT id
+            FROM fat_snf_charts
+            WHERE user_id = %s
+              AND milk_type = %s
+              AND effective_from = %s
+              AND status = 'active'
+            LIMIT 1
+            """,
+            (user_id, milk_type, effective_date)
+        )
+
+        if cursor.fetchone():
+            return fsn_error(
+                "An active chart already exists for this milk type and date."
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO fat_snf_charts
+                (user_id, created_by_staff_id, chart_name,
+                 milk_type, effective_from, status)
+            VALUES (%s, %s, %s, %s, %s, 'active')
+            """,
+            (
+                user_id,
+                session.get("staff_id"),
+                chart_name,
+                milk_type,
+                effective_date
+            )
+        )
+
+        chart_id = cursor.lastrowid
+
+        for fat, snf, rate in cleaned_matrix:
+            cursor.execute(
+                """
+                INSERT INTO fat_snf_chart_values
+                    (chart_id, fat, snf, rate)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (chart_id, fat, snf, rate)
+            )
+
+        mysql.connection.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "FAT/SNF rate chart created successfully.",
+            "chart_id": chart_id
+        }), 201
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception("FAT/SNF chart creation failed.")
+
+        return fsn_error(
+            "Unable to save the rate chart. Check the server logs.",
+            500
+        )
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 7. VIEW A RATE CHART
+# GET /api/fat_snf/charts/<chart_id>
+# ============================================================
+
+@app.route("/api/fat_snf/charts/<int:chart_id>", methods=["GET"])
+def get_fat_snf_chart_api(chart_id):
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    cursor = fsn_get_cursor()
+
+    try:
+        chart = fsn_fetch_chart(chart_id, user_id, cursor)
+
+        if not chart:
+            return fsn_error("Chart not found.", 404)
+
+        cursor.execute(
+            """
+            SELECT id, fat, snf, rate
+            FROM fat_snf_chart_values
+            WHERE chart_id = %s
+            ORDER BY fat ASC, snf ASC
+            """,
+            (chart_id,)
+        )
+
+        values = cursor.fetchall()
+
+        return jsonify({
+            "success": True,
+            "chart": fsn_row_dict(chart),
+            "values": [fsn_row_dict(row) for row in values]
+        })
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 8. DEACTIVATE RATE CHART
+# POST /api/fat_snf/charts/<chart_id>/deactivate
+# ============================================================
+
+@app.route(
+    "/api/fat_snf/charts/<int:chart_id>/deactivate",
+    methods=["POST"]
+)
+def deactivate_fat_snf_chart(chart_id):
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    cursor = fsn_get_cursor()
+
+    try:
+        chart = fsn_fetch_chart(chart_id, user_id, cursor)
+
+        if not chart:
+            return fsn_error("Chart not found.", 404)
+
+        cursor.execute(
+            """
+            UPDATE fat_snf_charts
+            SET status = 'inactive'
+            WHERE id = %s AND user_id = %s
+            """,
+            (chart_id, user_id)
+        )
+
+        mysql.connection.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Rate chart deactivated successfully."
+        })
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception("FAT/SNF chart deactivation failed.")
+        return fsn_error("Unable to deactivate the chart.", 500)
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 9. AUTOMATIC RATE LOOKUP API
+# GET /api/fat_snf/rate
+# ============================================================
+
+@app.route("/api/fat_snf/rate", methods=["GET"])
+def get_fat_snf_rate():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    try:
+        milk_type = str(
+            request.args.get("milk_type", "")
+        ).strip().lower()
+
+        if milk_type not in ("cow", "buffalo"):
+            raise ValueError("Milk type must be cow or buffalo.")
+
+        fat = fsn_validate_fat(request.args.get("fat"))
+        snf = fsn_validate_snf(request.args.get("snf"))
+        selected_date = fsn_parse_date(
+            request.args.get("date") or date.today().isoformat()
+        )
+
+    except ValueError as exc:
+        return fsn_error(str(exc))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        result = fsn_find_rate(
+            user_id,
+            milk_type,
+            fat,
+            snf,
+            selected_date,
+            cursor
+        )
+
+        return jsonify({
+            "success": True,
+            "chart_id": result["chart_id"],
+            "chart_name": result["chart_name"],
+            "chart_value_id": result["chart_value_id"],
+            "fat": float(fat),
+            "snf": float(snf),
+            "rate": float(result["rate"])
+        })
+
+    except ValueError as exc:
+        return fsn_error(str(exc), 404)
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 10. FAT/SNF MILK COLLECTION PAGE
+# Template: templates/fat_snf/milk_collection.html
+# ============================================================
+
+@app.route("/fat_snf/milk_collection", methods=["GET"])
+def fat_snf_milk_collection():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return redirect(url_for("login"))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT vendor_id, name, phone
+            FROM vendors
+            WHERE user_id = %s
+            ORDER BY name ASC
+            """,
+            (user_id,)
+        )
+
+        vendors = cursor.fetchall()
+
+        return render_template(
+            "fat_snf/milk_collection.html",
+            vendors=vendors
+        )
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 11. SAVE FAT/SNF MILK COLLECTION
+# POST /api/fat_snf/milk_collection
+# ============================================================
+
+@app.route("/api/fat_snf/milk_collection", methods=["POST"])
+def save_fat_snf_milk_collection():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    try:
+        data = fsn_get_json()
+
+        vendor_id = int(data.get("vendor_id"))
+        selected_date = fsn_parse_date(data.get("collection_date"))
+
+        slot = str(data.get("slot", "")).strip().lower()
+        milk_type = str(data.get("milk_type", "")).strip().lower()
+
+        fat = fsn_validate_fat(data.get("fat"))
+        snf = fsn_validate_snf(data.get("snf"))
+        quantity = fsn_validate_quantity(data.get("quantity"))
+
+        if vendor_id <= 0:
+            raise ValueError("Invalid vendor.")
+
+        if slot not in ("morning", "evening"):
+            raise ValueError("Invalid collection slot.")
+
+        if milk_type not in ("cow", "buffalo"):
+            raise ValueError("Invalid milk type.")
+
+    except (ValueError, TypeError) as exc:
+        return fsn_error(str(exc))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        # Verify vendor ownership.
+        cursor.execute(
+            """
+            SELECT vendor_id
+            FROM vendors
+            WHERE vendor_id = %s AND user_id = %s
+            LIMIT 1
+            """,
+            (vendor_id, user_id)
+        )
+
+        if not cursor.fetchone():
+            return fsn_error("Vendor not found.", 404)
+
+        # Prevent duplicate entries for the same vendor/date/slot/type.
+        cursor.execute(
+            """
+            SELECT id
+            FROM fat_snf_milk_collection
+            WHERE user_id = %s
+              AND vendor_id = %s
+              AND collection_date = %s
+              AND slot = %s
+              AND milk_type = %s
+            LIMIT 1
+            """,
+            (
+                user_id,
+                vendor_id,
+                selected_date,
+                slot,
+                milk_type
+            )
+        )
+
+        if cursor.fetchone():
+            return fsn_error(
+                "An entry already exists for this vendor, date, slot and milk type.",
+                409
+            )
+
+        rate_data = fsn_find_rate(
+            user_id,
+            milk_type,
+            fat,
+            snf,
+            selected_date,
+            cursor
+        )
+
+        rate = rate_data["rate"]
+        amount = fsn_money(quantity * rate)
+
+        cursor.execute(
+            """
+            INSERT INTO fat_snf_milk_collection (
+                user_id,
+                vendor_id,
+                staff_id,
+                chart_id,
+                chart_value_id,
+                collection_date,
+                slot,
+                milk_type,
+                fat,
+                snf,
+                quantity,
+                rate,
+                amount
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                user_id,
+                vendor_id,
+                session.get("staff_id"),
+                rate_data["chart_id"],
+                rate_data["chart_value_id"],
+                selected_date,
+                slot,
+                milk_type,
+                fat,
+                snf,
+                quantity,
+                rate,
+                amount
+            )
+        )
+
+        entry_id = cursor.lastrowid
+
+        mysql.connection.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "FAT/SNF milk entry saved successfully.",
+            "entry_id": entry_id,
+            "rate": float(rate),
+            "amount": float(amount)
+        }), 201
+
+    except ValueError as exc:
+        mysql.connection.rollback()
+        return fsn_error(str(exc), 400)
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception("FAT/SNF collection save failed.")
+        return fsn_error("Unable to save milk collection.", 500)
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 12. GET ONE COLLECTION ENTRY FOR EDITING
+# GET /api/fat_snf/milk_collection/<entry_id>
+# ============================================================
+
+@app.route(
+    "/api/fat_snf/milk_collection/<int:entry_id>",
+    methods=["GET"]
+)
+def get_fat_snf_milk_entry(entry_id):
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                m.id,
+                m.vendor_id,
+                v.name AS vendor_name,
+                m.collection_date,
+                m.slot,
+                m.milk_type,
+                m.fat,
+                m.snf,
+                m.quantity,
+                m.rate,
+                m.amount,
+                m.chart_id
+            FROM fat_snf_milk_collection AS m
+            INNER JOIN vendors AS v
+                ON v.vendor_id = m.vendor_id
+               AND v.user_id = m.user_id
+            WHERE m.id = %s
+              AND m.user_id = %s
+            LIMIT 1
+            """,
+            (entry_id, user_id)
+        )
+
+        entry = cursor.fetchone()
+
+        if not entry:
+            return fsn_error("Collection entry not found.", 404)
+
+        return jsonify({
+            "success": True,
+            "entry": fsn_row_dict(entry)
+        })
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 13. UPDATE COLLECTION ENTRY
+# PUT /api/fat_snf/milk_collection/<entry_id>
+# ============================================================
+
+@app.route(
+    "/api/fat_snf/milk_collection/<int:entry_id>",
+    methods=["PUT"]
+)
+def update_fat_snf_milk_entry(entry_id):
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    try:
+        data = fsn_get_json()
+
+        fat = fsn_validate_fat(data.get("fat"))
+        snf = fsn_validate_snf(data.get("snf"))
+        quantity = fsn_validate_quantity(data.get("quantity"))
+
+    except ValueError as exc:
+        return fsn_error(str(exc))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                vendor_id,
+                collection_date,
+                slot,
+                milk_type
+            FROM fat_snf_milk_collection
+            WHERE id = %s AND user_id = %s
+            LIMIT 1
+            """,
+            (entry_id, user_id)
+        )
+
+        entry = cursor.fetchone()
+
+        if not entry:
+            return fsn_error("Collection entry not found.", 404)
+
+        # Do not accept rate or amount from the frontend.
+        rate_data = fsn_find_rate(
+            user_id,
+            entry["milk_type"],
+            fat,
+            snf,
+            entry["collection_date"],
+            cursor
+        )
+
+        rate = rate_data["rate"]
+        amount = fsn_money(quantity * rate)
+
+        cursor.execute(
+            """
+            UPDATE fat_snf_milk_collection
+            SET
+                chart_id = %s,
+                chart_value_id = %s,
+                fat = %s,
+                snf = %s,
+                quantity = %s,
+                rate = %s,
+                amount = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+              AND user_id = %s
+            """,
+            (
+                rate_data["chart_id"],
+                rate_data["chart_value_id"],
+                fat,
+                snf,
+                quantity,
+                rate,
+                amount,
+                entry_id,
+                user_id
+            )
+        )
+
+        mysql.connection.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Milk entry updated successfully.",
+            "rate": float(rate),
+            "amount": float(amount)
+        })
+
+    except ValueError as exc:
+        mysql.connection.rollback()
+        return fsn_error(str(exc), 400)
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception("FAT/SNF collection update failed.")
+        return fsn_error("Unable to update milk entry.", 500)
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 14. COLLECTION HISTORY / EDIT PAGE
+# Template: templates/fat_snf/edit_entry.html
+# ============================================================
+
+@app.route("/fat_snf/edit_entry", methods=["GET"])
+def fat_snf_edit_entry():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return redirect(url_for("login"))
+
+    try:
+        selected_date = fsn_parse_date(
+            request.args.get("date") or date.today().isoformat()
+        )
+    except ValueError:
+        selected_date = date.today()
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                m.id,
+                m.vendor_id,
+                v.name AS vendor_name,
+                m.collection_date,
+                m.slot,
+                m.milk_type,
+                m.fat,
+                m.snf,
+                m.quantity,
+                m.rate,
+                m.amount
+            FROM fat_snf_milk_collection AS m
+            INNER JOIN vendors AS v
+                ON v.vendor_id = m.vendor_id
+               AND v.user_id = m.user_id
+            WHERE m.user_id = %s
+              AND m.collection_date = %s
+            ORDER BY v.name ASC, m.slot ASC, m.milk_type ASC
+            """,
+            (user_id, selected_date)
+        )
+
+        entries = cursor.fetchall()
+
+        return render_template(
+            "fat_snf/edit_entry.html",
+            entries=entries,
+            selected_date=selected_date.isoformat()
+        )
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 15. GET CALCULATION MODE
+# GET /api/fat_snf/calculation_mode
+# ============================================================
+
+@app.route("/api/fat_snf/calculation_mode", methods=["GET"])
+def get_calculation_mode():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT calculation_mode
+            FROM fat_snf_calculation_settings
+            WHERE user_id = %s
+            LIMIT 1
+            """,
+            (user_id,)
+        )
+
+        row = cursor.fetchone()
+
+        mode = row["calculation_mode"] if row else "general"
+
+        return jsonify({
+            "success": True,
+            "calculation_mode": mode
+        })
+
+    finally:
+        cursor.close()
+
+
+# ============================================================
+# 16. CHANGE CALCULATION MODE
+# POST /api/fat_snf/calculation_mode
+# ============================================================
+
+@app.route("/api/fat_snf/calculation_mode", methods=["POST"])
+def set_calculation_mode():
+    user_id = fsn_current_user_id()
+
+    if not user_id:
+        return fsn_error("Unauthorized access.", 401)
+
+    try:
+        data = fsn_get_json()
+
+        mode = str(
+            data.get("calculation_mode", "")
+        ).strip().lower()
+
+        if mode not in ("general", "fat_snf"):
+            raise ValueError(
+                "Calculation mode must be 'general' or 'fat_snf'."
+            )
+
+    except ValueError as exc:
+        return fsn_error(str(exc))
+
+    cursor = fsn_get_cursor()
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO fat_snf_calculation_settings
+                (user_id, calculation_mode)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE
+                calculation_mode = VALUES(calculation_mode),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, mode)
+        )
+
+        mysql.connection.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Calculation mode updated successfully.",
+            "calculation_mode": mode
+        })
+
+    except Exception:
+        mysql.connection.rollback()
+        app.logger.exception("Calculation mode update failed.")
+        return fsn_error("Unable to update calculation mode.", 500)
+
+    finally:
+        cursor.close()
+
+
+
+
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
